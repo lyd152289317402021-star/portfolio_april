@@ -40,6 +40,7 @@ A_SHARE_INDEX_ALIASES = {
     "创业板指": "399006",
 }
 A_SHARE_INDEX_CODES = {"000016", "000300", "000905", "000852", "000688", "399001", "399006"}
+A_SHARE_INDEX_EM_SYMBOLS = {"000001": "sh000001", "000016": "sh000016", "000300": "csi000300", "000905": "csi000905", "000852": "csi000852", "000688": "sh000688", "399001": "sz399001", "399006": "sz399006"}
 HONGKONG_INDEX_SYMBOLS = {"^HSI", "^HSCE", "^HSCI"}
 MANUAL_NAME_ENTRIES = [
     {"代码": "600519", "名称": "贵州茅台", "类型": "A股", "别名": "茅台"},
@@ -535,6 +536,19 @@ def to_akshare_symbol(ticker):
     return normalized
 
 
+def to_akshare_index_em_symbol(ticker):
+    code = to_akshare_symbol(ticker)
+    if code in A_SHARE_INDEX_EM_SYMBOLS:
+        return A_SHARE_INDEX_EM_SYMBOLS[code]
+    if str(code).startswith("399"):
+        return f"sz{code}"
+    if str(code).startswith(("000", "880")):
+        return f"csi{code}"
+    if str(code).startswith(("50", "68")):
+        return f"sh{code}"
+    return f"csi{code}"
+
+
 def _extract_close_series(df, ticker):
     if df is None or df.empty:
         return pd.Series(dtype=float, name=ticker)
@@ -608,15 +622,44 @@ def fetch_akshare_stock_series(ticker, start_date, end_date, adjust_label):
 
 @st.cache_data(show_spinner=False)
 def fetch_akshare_index_series(ticker, start_date, end_date):
+    normalized = normalize_ticker(ticker, market_hint="A股")
     if ak is None:
-        return pd.Series(dtype=float, name=normalize_ticker(ticker, market_hint="A股"))
-    df = ak.index_zh_a_hist(
-        symbol=to_akshare_symbol(ticker),
-        period="daily",
-        start_date=pd.Timestamp(start_date).strftime("%Y%m%d"),
-        end_date=pd.Timestamp(end_date).strftime("%Y%m%d"),
-    )
-    return _extract_close_series(df, normalize_ticker(ticker, market_hint="A股"))
+        return pd.Series(dtype=float, name=normalized)
+
+    start_s = pd.Timestamp(start_date).strftime("%Y%m%d")
+    end_s = pd.Timestamp(end_date).strftime("%Y%m%d")
+
+    tried = []
+
+    try:
+        df = ak.index_zh_a_hist(
+            symbol=to_akshare_symbol(ticker),
+            period="daily",
+            start_date=start_s,
+            end_date=end_s,
+        )
+        series = _extract_close_series(df, normalized)
+        if not series.empty:
+            return series
+        tried.append("index_zh_a_hist(empty)")
+    except Exception as e:
+        tried.append(f"index_zh_a_hist({e})")
+
+    try:
+        if hasattr(ak, "stock_zh_index_daily_em"):
+            df = ak.stock_zh_index_daily_em(
+                symbol=to_akshare_index_em_symbol(ticker),
+                start_date=start_s,
+                end_date=end_s,
+            )
+            series = _extract_close_series(df, normalized)
+            if not series.empty:
+                return series
+            tried.append("stock_zh_index_daily_em(empty)")
+    except Exception as e:
+        tried.append(f"stock_zh_index_daily_em({e})")
+
+    raise RuntimeError(" ; ".join(tried[-2:] if tried else ["AKShare index fetch failed"]))
 
 
 @st.cache_data(show_spinner=False)
