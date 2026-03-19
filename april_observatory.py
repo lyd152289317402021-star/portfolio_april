@@ -2,6 +2,11 @@ from datetime import date, timedelta
 import math
 import re
 
+try:
+    import requests
+except Exception:
+    requests = None
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -571,39 +576,150 @@ def _extract_close_series(df, ticker):
 
 @st.cache_data(show_spinner=False)
 def fetch_yfinance_series(ticker, start_date, end_date, market_hint):
+    normalized = normalize_ticker(ticker, market_hint=market_hint)
     if yf is None:
-        return pd.Series(dtype=float, name=normalize_ticker(ticker, market_hint=market_hint))
-    symbol = to_yfinance_symbol(ticker, market_hint=market_hint)
-    raw = yf.download(
-        tickers=symbol,
-        start=start_date,
-        end=end_date,
-        auto_adjust=True,
-        progress=False,
-        group_by="column",
-        threads=False,
-    )
-    if raw is None or raw.empty:
-        return pd.Series(dtype=float, name=normalize_ticker(ticker, market_hint=market_hint))
-    if isinstance(raw.columns, pd.MultiIndex):
-        if "Close" in raw.columns.get_level_values(0):
-            prices = raw["Close"].copy()
-        elif "Adj Close" in raw.columns.get_level_values(0):
-            prices = raw["Adj Close"].copy()
+        return pd.Series(dtype=float, name=normalized)
+
+    symbols = []
+    primary = to_yfinance_symbol(ticker, market_hint=market_hint)
+    for s in [primary]:
+        if s and s not in symbols:
+            symbols.append(s)
+
+    # A股指数给几个更稳的回退符号，尤其是沪深300。
+    if detect_market(normalized, market_hint=market_hint) == "A股" and infer_a_share_security_type(normalized) == "指数":
+        code = to_akshare_symbol(normalized)
+        alt_map = {
+            "000300": ["000300.SS", "399300.SZ"],
+            "000001": ["000001.SS", "^SSEC"],
+            "399001": ["399001.SZ"],
+            "399006": ["399006.SZ"],
+            "000016": ["000016.SS"],
+            "000905": ["000905.SH", "000905.SS"],
+            "000852": ["000852.SH", "000852.SS"],
+            "000688": ["000688.SS"],
+        }
+        for s in alt_map.get(code, []):
+            if s not in symbols:
+                symbols.append(s)
+
+    for symbol in symbols:
+        try:
+            raw = yf.download(
+                tickers=symbol,
+                start=start_date,
+                end=end_date,
+                auto_adjust=True,
+                progress=False,
+                group_by="column",
+                threads=False,
+            )
+        except Exception:
+            continue
+        if raw is None or raw.empty:
+            continue
+        if isinstance(raw.columns, pd.MultiIndex):
+            if "Close" in raw.columns.get_level_values(0):
+                prices = raw["Close"].copy()
+            elif "Adj Close" in raw.columns.get_level_values(0):
+                prices = raw["Adj Close"].copy()
+            else:
+                continue
+            if isinstance(prices, pd.DataFrame):
+                series = prices.iloc[:, 0]
+            else:
+                series = prices
         else:
-            return pd.Series(dtype=float, name=normalize_ticker(ticker, market_hint=market_hint))
-        if isinstance(prices, pd.DataFrame):
-            series = prices.iloc[:, 0]
-        else:
-            series = prices
+            close_col = "Close" if "Close" in raw.columns else "Adj Close" if "Adj Close" in raw.columns else None
+            if close_col is None:
+                continue
+            series = raw[close_col]
+        series = pd.to_numeric(series, errors="coerce").dropna().sort_index()
+        if not series.empty:
+            series.name = normalized
+            return series
+
+    return pd.Series(dtype=float, name=normalized)
+
+
+@st.cache_data(show_spinner=False)
+def fetch_eastmoney_index_series(ticker, start_date, end_date):
+    normalized = normalize_ticker(ticker, market_hint="A股")
+    if requests is None:
+        return pd.Series(dtype=float, name=normalized)
+
+    code = to_akshare_symbol(ticker)
+    secids = []
+    if code.startswith("399"):
+        secids.append(f"0.{code}")
     else:
-        close_col = "Close" if "Close" in raw.columns else "Adj Close" if "Adj Close" in raw.columns else None
-        if close_col is None:
-            return pd.Series(dtype=float, name=normalize_ticker(ticker, market_hint=market_hint))
-        series = raw[close_col]
-    series = pd.to_numeric(series, errors="coerce").dropna().sort_index()
-    series.name = normalize_ticker(ticker, market_hint=market_hint)
-    return series
+        secids.append(f"1.{code}")
+
+    # 沪深300等中证指数常见别名回退。
+    secid_fallbacks = {
+        "000300": ["1.000300", "0.399300"],
+        "000905": ["1.000905"],
+        "000852": ["1.000852"],
+        "000688": ["1.000688"],
+        "000016": ["1.000016"],
+        "000001": ["1.000001"],
+        "399001": ["0.399001"],
+        "399006": ["0.399006"],
+    }
+    for s in secid_fallbacks.get(code, []):
+        if s not in secids:
+            secids.append(s)
+
+    start_s = pd.Timestamp(start_date).strftime("%Y%m%d")
+    end_s = pd.Timestamp(end_date).strftime("%Y%m%d")
+    params_base = {
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": "101",
+        "fqt": "0",
+        "beg": start_s,
+        "end": end_s,
+        "lmt": "1000000",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://quote.eastmoney.com/",
+    }
+
+    for secid in secids:
+        try:
+            resp = requests.get(
+                "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+                params={**params_base, "secid": secid},
+                headers=headers,
+                timeout=12,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            klines = (((payload or {}).get("data") or {}).get("klines")) or []
+            if not klines:
+                continue
+            rows = []
+            for item in klines:
+                parts = str(item).split(",")
+                if len(parts) >= 3:
+                    rows.append((parts[0], parts[2]))
+            if not rows:
+                continue
+            df = pd.DataFrame(rows, columns=["date", "close"])
+            out = pd.DataFrame({
+                "date": pd.to_datetime(df["date"], errors="coerce"),
+                "close": pd.to_numeric(df["close"], errors="coerce"),
+            }).dropna()
+            if out.empty:
+                continue
+            series = out.drop_duplicates(subset=["date"]).set_index("date")["close"].sort_index()
+            series.name = normalized
+            return series
+        except Exception:
+            continue
+
+    return pd.Series(dtype=float, name=normalized)
 
 
 @st.cache_data(show_spinner=False)
@@ -712,6 +828,7 @@ def fetch_one_series(ticker, start_date, end_date, market_hint, data_source_mode
             if security_type == "指数" or role == "benchmark":
                 plans = [
                     ("AKShare-指数", lambda: fetch_akshare_index_series(normalized, start_date, end_date)),
+                    ("东方财富直连-指数", lambda: fetch_eastmoney_index_series(normalized, start_date, end_date)),
                     ("Yahoo Finance", lambda: fetch_yfinance_series(normalized, start_date, end_date, market)),
                     ("AKShare-ETF", lambda: fetch_akshare_etf_series(normalized, start_date, end_date, a_share_adjust)),
                     ("AKShare-A股股票", lambda: fetch_akshare_stock_series(normalized, start_date, end_date, a_share_adjust)),
@@ -778,7 +895,7 @@ def download_prices(tickers, start_date, end_date, benchmark, market_hint, data_
             series_map[ticker] = series
             source_map[ticker] = source
         elif errors:
-            error_map[ticker] = " | ".join(errors[-3:])
+            error_map[ticker] = " | ".join(errors)
 
     if not series_map:
         return pd.DataFrame(), source_map, error_map
@@ -1149,7 +1266,7 @@ def download_prices_with_roles(tickers, benchmark_like_tickers, start_date, end_
             series_map[ticker] = series
             source_map[ticker] = source
         elif errors:
-            error_map[ticker] = " | ".join(errors[-3:])
+            error_map[ticker] = " | ".join(errors)
 
     if not series_map:
         return pd.DataFrame(), source_map, error_map
