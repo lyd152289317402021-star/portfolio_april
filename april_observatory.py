@@ -39,6 +39,8 @@ A_SHARE_INDEX_ALIASES = {
     "深证成指": "399001",
     "创业板指": "399006",
 }
+A_SHARE_INDEX_CODES = {"000016", "000300", "000905", "000852", "000688", "399001", "399006"}
+HONGKONG_INDEX_SYMBOLS = {"^HSI", "^HSCE", "^HSCI"}
 MANUAL_NAME_ENTRIES = [
     {"代码": "600519", "名称": "贵州茅台", "类型": "A股", "别名": "茅台"},
     {"代码": "300750", "名称": "宁德时代", "类型": "A股", "别名": ""},
@@ -465,13 +467,36 @@ def parse_manual_inputs(text, market_hint="智能识别"):
 
 def detect_market(ticker, market_hint="智能识别"):
     normalized = normalize_ticker(ticker, market_hint=market_hint)
-    if market_hint in {"美股", "港股", "A股"}:
-        return market_hint
-    if normalized.endswith(".HK"):
+    if normalized in HONGKONG_INDEX_SYMBOLS or normalized.endswith(".HK"):
         return "港股"
     if normalized.isdigit() and len(normalized) == 6:
         return "A股"
+    if re.fullmatch(r"[A-Z][A-Z0-9\-\^=]{0,20}", normalized or ""):
+        return "美股"
+    if market_hint in {"美股", "港股", "A股"}:
+        return market_hint
     return "美股"
+
+
+def infer_a_share_security_type(ticker):
+    code = to_akshare_symbol(ticker)
+    if code in A_SHARE_INDEX_CODES:
+        return "指数"
+    try:
+        universe = load_name_universe()
+        if not universe.empty and "代码" in universe.columns and "类型" in universe.columns:
+            hits = universe.loc[universe["代码"].astype(str) == str(code), "类型"].astype(str).tolist()
+            if "指数" in hits:
+                return "指数"
+            if "ETF" in hits:
+                return "ETF"
+            if "LOF" in hits:
+                return "LOF"
+            if "A股" in hits:
+                return "A股"
+    except Exception:
+        pass
+    return "A股"
 
 
 def a_share_adjust_code(label):
@@ -483,6 +508,11 @@ def to_yfinance_symbol(ticker, market_hint="智能识别"):
     normalized = normalize_ticker(ticker, market_hint=market_hint)
     market = detect_market(normalized, market_hint=market_hint)
     if market == "A股" and normalized.isdigit() and len(normalized) == 6:
+        security_type = infer_a_share_security_type(normalized)
+        if security_type == "指数":
+            if normalized.startswith("399"):
+                return f"{normalized}.SZ"
+            return f"{normalized}.SS"
         if normalized.startswith(("60", "68", "90")):
             return f"{normalized}.SS"
         if normalized.startswith(("00", "30")):
@@ -632,24 +662,42 @@ def fetch_one_series(ticker, start_date, end_date, market_hint, data_source_mode
         return None, None
 
     if market == "A股":
+        security_type = infer_a_share_security_type(normalized)
         if data_source_mode == "仅 Yahoo Finance":
             plans = [("Yahoo Finance", lambda: fetch_yfinance_series(normalized, start_date, end_date, market))]
-        elif role == "benchmark":
-            plans = [
-                ("AKShare-指数", lambda: fetch_akshare_index_series(normalized, start_date, end_date)),
-                ("AKShare-A股股票", lambda: fetch_akshare_stock_series(normalized, start_date, end_date, a_share_adjust)),
-                ("AKShare-ETF", lambda: fetch_akshare_etf_series(normalized, start_date, end_date, a_share_adjust)),
-                ("AKShare-LOF", lambda: fetch_akshare_lof_series(normalized, start_date, end_date, a_share_adjust)),
-                ("Yahoo Finance", lambda: fetch_yfinance_series(normalized, start_date, end_date, market)),
-            ]
         else:
-            plans = [
-                ("AKShare-A股股票", lambda: fetch_akshare_stock_series(normalized, start_date, end_date, a_share_adjust)),
-                ("AKShare-ETF", lambda: fetch_akshare_etf_series(normalized, start_date, end_date, a_share_adjust)),
-                ("AKShare-LOF", lambda: fetch_akshare_lof_series(normalized, start_date, end_date, a_share_adjust)),
-                ("AKShare-指数", lambda: fetch_akshare_index_series(normalized, start_date, end_date)),
-                ("Yahoo Finance", lambda: fetch_yfinance_series(normalized, start_date, end_date, market)),
-            ]
+            if security_type == "指数" or role == "benchmark":
+                plans = [
+                    ("AKShare-指数", lambda: fetch_akshare_index_series(normalized, start_date, end_date)),
+                    ("Yahoo Finance", lambda: fetch_yfinance_series(normalized, start_date, end_date, market)),
+                    ("AKShare-ETF", lambda: fetch_akshare_etf_series(normalized, start_date, end_date, a_share_adjust)),
+                    ("AKShare-A股股票", lambda: fetch_akshare_stock_series(normalized, start_date, end_date, a_share_adjust)),
+                    ("AKShare-LOF", lambda: fetch_akshare_lof_series(normalized, start_date, end_date, a_share_adjust)),
+                ]
+            elif security_type == "ETF":
+                plans = [
+                    ("AKShare-ETF", lambda: fetch_akshare_etf_series(normalized, start_date, end_date, a_share_adjust)),
+                    ("Yahoo Finance", lambda: fetch_yfinance_series(normalized, start_date, end_date, market)),
+                    ("AKShare-A股股票", lambda: fetch_akshare_stock_series(normalized, start_date, end_date, a_share_adjust)),
+                    ("AKShare-LOF", lambda: fetch_akshare_lof_series(normalized, start_date, end_date, a_share_adjust)),
+                    ("AKShare-指数", lambda: fetch_akshare_index_series(normalized, start_date, end_date)),
+                ]
+            elif security_type == "LOF":
+                plans = [
+                    ("AKShare-LOF", lambda: fetch_akshare_lof_series(normalized, start_date, end_date, a_share_adjust)),
+                    ("Yahoo Finance", lambda: fetch_yfinance_series(normalized, start_date, end_date, market)),
+                    ("AKShare-ETF", lambda: fetch_akshare_etf_series(normalized, start_date, end_date, a_share_adjust)),
+                    ("AKShare-A股股票", lambda: fetch_akshare_stock_series(normalized, start_date, end_date, a_share_adjust)),
+                    ("AKShare-指数", lambda: fetch_akshare_index_series(normalized, start_date, end_date)),
+                ]
+            else:
+                plans = [
+                    ("AKShare-A股股票", lambda: fetch_akshare_stock_series(normalized, start_date, end_date, a_share_adjust)),
+                    ("Yahoo Finance", lambda: fetch_yfinance_series(normalized, start_date, end_date, market)),
+                    ("AKShare-ETF", lambda: fetch_akshare_etf_series(normalized, start_date, end_date, a_share_adjust)),
+                    ("AKShare-LOF", lambda: fetch_akshare_lof_series(normalized, start_date, end_date, a_share_adjust)),
+                    ("AKShare-指数", lambda: fetch_akshare_index_series(normalized, start_date, end_date)),
+                ]
     else:
         plans = [("Yahoo Finance", lambda: fetch_yfinance_series(normalized, start_date, end_date, market))]
 
@@ -687,7 +735,7 @@ def download_prices(tickers, start_date, end_date, benchmark, market_hint, data_
             series_map[ticker] = series
             source_map[ticker] = source
         elif errors:
-            error_map[ticker] = errors[-1]
+            error_map[ticker] = " | ".join(errors[-3:])
 
     if not series_map:
         return pd.DataFrame(), source_map, error_map
@@ -1058,7 +1106,7 @@ def download_prices_with_roles(tickers, benchmark_like_tickers, start_date, end_
             series_map[ticker] = series
             source_map[ticker] = source
         elif errors:
-            error_map[ticker] = errors[-1]
+            error_map[ticker] = " | ".join(errors[-3:])
 
     if not series_map:
         return pd.DataFrame(), source_map, error_map
@@ -1222,6 +1270,7 @@ with left_col:
             value=st.session_state.quick_add_manual,
             placeholder="输入代码或名称，例如：AAPL、TSM、0700.HK、600519、贵州茅台、沪深300",
             label_visibility="collapsed",
+            key="search_input_main",
         )
         st.session_state.quick_add_manual = query_input
         st.session_state.name_search_query = query_input
@@ -1243,6 +1292,7 @@ with left_col:
                 default=[],
                 placeholder="搜索结果会显示在这里，可直接勾选加入",
                 label_visibility="collapsed",
+                key="search_hit_multiselect",
             )
         else:
             selected_name_hits = []
@@ -1252,7 +1302,7 @@ with left_col:
                 st.caption("支持代码直接输入；名称搜索会在下方自动出现结果。")
 
         add_col, reset_col, clear_col = st.columns(3)
-        if add_col.button("加入", use_container_width=True):
+        if add_col.button("加入", use_container_width=True, key="btn_add_assets"):
             manual_items = parse_manual_inputs(st.session_state.quick_add_manual, market_hint=market_mode)
             search_items = [hit_map[label] for label in selected_name_hits if label in hit_map]
             pending = normalize_tickers(manual_items + search_items, market_hint=market_mode)
@@ -1266,32 +1316,32 @@ with left_col:
             st.session_state.quick_add_manual = ""
             st.session_state.name_search_query = ""
             st.rerun()
-        if reset_col.button("恢复默认", use_container_width=True):
+        if reset_col.button("恢复默认", use_container_width=True, key="btn_reset_assets"):
             st.session_state.portfolio_table = default_portfolio_rows()
             st.rerun()
-        if clear_col.button("清空", use_container_width=True):
+        if clear_col.button("清空", use_container_width=True, key="btn_clear_assets"):
             st.session_state.portfolio_table = pd.DataFrame({"Ticker": [], "Weight": []})
             st.rerun()
 
 with right_col:
     with st.container(border=True):
         st.markdown("<div class='panel-title'>2) 方案</div>", unsafe_allow_html=True)
-        preset_name = st.text_input("方案名称", value="", placeholder="例如：美股科技 / 红利 / A股白马")
+        preset_name = st.text_input("方案名称", value="", placeholder="例如：美股科技 / 红利 / A股白马", key="preset_name_input")
         preset_options = list(st.session_state.saved_presets.keys())
-        chosen = st.selectbox("方案", options=[""] + preset_options, label_visibility="collapsed")
+        chosen = st.selectbox("方案", options=[""] + preset_options, label_visibility="collapsed", key="preset_selector")
         p1, p2 = st.columns(2)
-        if p1.button("保存", use_container_width=True):
+        if p1.button("保存", use_container_width=True, key="btn_save_preset"):
             name = preset_name.strip()
             if name:
                 st.session_state.saved_presets[name] = st.session_state.portfolio_table.copy()
-        if p2.button("载入", use_container_width=True) and chosen:
+        if p2.button("载入", use_container_width=True, key="btn_load_preset") and chosen:
             st.session_state.portfolio_table = st.session_state.saved_presets[chosen].copy()
             st.rerun()
         p3, p4 = st.columns(2)
-        if p3.button("删除", use_container_width=True) and chosen:
+        if p3.button("删除", use_container_width=True, key="btn_delete_preset") and chosen:
             st.session_state.saved_presets.pop(chosen, None)
             st.rerun()
-        if p4.button("清空方案", use_container_width=True):
+        if p4.button("清空方案", use_container_width=True, key="btn_clear_preset"):
             st.session_state.saved_presets = {}
             st.rerun()
 
